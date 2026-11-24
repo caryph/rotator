@@ -69,12 +69,21 @@ async def on_message(message: discord.Message):
 
 # leafbot-style manual sync: per-guild, instant, run it yourself when you change
 # a command. Needs the applications.commands scope on the invite.
+#
+# discord.py >=2.7 gotcha: tree.sync(guild=g) only uploads commands registered
+# *for that guild* (tree._guild_commands[g.id]); global commands are excluded,
+# so with a plain @bot.hybrid_command the payload is empty, an empty payload
+# wipes that guild's guild-scoped commands, and sync() returns [].
+# Fix: copy each global command into the current guild's bucket before syncing.
 @bot.command(name="sync")
+@commands.guild_only()
 async def sync_cmd(ctx: commands.Context):
     if ctx.author.id != OWNER_ID:
         return
+    for cmd in bot.tree.get_commands(guild=None):
+        bot.tree.add_command(cmd.copy(), guild=ctx.guild, override=True)
     synced = await bot.tree.sync(guild=ctx.guild)
-    await ctx.send(f"synced {[c.name for c in synced]}")
+    await ctx.send(f"synced {[c.name for c in synced]} in {ctx.guild.name}")
 
 
 @bot.hybrid_command(name="level", description="Show your current level and XP.")
