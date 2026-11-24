@@ -66,15 +66,40 @@ def get_xp(guild_id: int, member_id: int) -> int:
     return member.xp if member else 0
 
 
-def add_xp(guild_id: int, member_id: int, amount: int, cooldown_until: float) -> None:
-    """Insert-or-update in one statement — no read-modify-write race."""
-    _db().execute(
+def add_xp(guild_id: int, member_id: int, amount: int, cooldown_until: float) -> int:
+    """Insert-or-update in one statement — no read-modify-write race. Returns new XP."""
+    row = _db().execute(
         """
         INSERT INTO members (guild_id, member_id, xp, xp_cooldown) VALUES (?, ?, ?, ?)
         ON CONFLICT(guild_id, member_id) DO UPDATE
             SET xp = xp + excluded.xp,
                 xp_cooldown = excluded.xp_cooldown
+        RETURNING xp
         """,
         (guild_id, member_id, amount, cooldown_until),
-    )
+    ).fetchone()
     _db().commit()
+    return row[0]
+
+
+def top_members(guild_id: int, limit: int = 10, offset: int = 0) -> list[Member]:
+    rows = _db().execute(
+        "SELECT guild_id, member_id, xp, xp_cooldown FROM members "
+        "WHERE guild_id = ? ORDER BY xp DESC, member_id LIMIT ? OFFSET ?",
+        (guild_id, limit, offset),
+    ).fetchall()
+    return [Member(*row) for row in rows]
+
+
+def get_rank(guild_id: int, member_id: int) -> tuple[int, int]:
+    """(1-based rank, members tracked). Rank 0 when the member has no XP row."""
+    total = _db().execute(
+        "SELECT COUNT(*) FROM members WHERE guild_id = ?", (guild_id,)
+    ).fetchone()[0]
+    xp = get_xp(guild_id, member_id)
+    if not xp:
+        return 0, total
+    better = _db().execute(
+        "SELECT COUNT(*) FROM members WHERE guild_id = ? AND xp > ?", (guild_id, xp)
+    ).fetchone()[0]
+    return better + 1, total
