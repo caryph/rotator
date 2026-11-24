@@ -1,0 +1,730 @@
+{
+  "version": 4,
+  "tool": {
+    "name": "pi",
+    "version": "unknown",
+    "plugins": [
+      "caveman"
+    ]
+  },
+  "model": {
+    "name": "qwen3.8-flash-next-iq3_s",
+    "runtime": "strata"
+  },
+  "price_usd": 0,
+  "subscription": null,
+  "comment": "base",
+  "description": "",
+  "stats": {
+    "turns": 47,
+    "tokens_in": 10287,
+    "tokens_out": 21959,
+    "cache_read": 742372
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "text": "hi"
+    },
+    {
+      "role": "assistant",
+      "text": "Hey. What are we working on?"
+    },
+    {
+      "role": "user",
+      "text": "discord bot"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Empty dir (`rotator`). Nothing here yet.\n\nNeed to know:\n\n1. **Language?** Python (discord.py) or Node (discord.js)?\n2. **What does it do?** \"rotator\" suggests something rotating — channel rotation? role rotation? status rotation? post scheduler?\n3. **Discord side ready?** Bot token, app created, intents enabled?\n\nTell me goal + language, I'll scaffold it."
+    },
+    {
+      "role": "user",
+      "text": "discord py\nsqlite\nslash commands\nuuuuhhhh very minimal leveling bot. slash commands. keep code contained to a single file. start with a database with member ids and 'xp' 'xp_cooldown' values. .env will have TOKEN. /level to view current level. a random amount of 15-20 xp gained every time user sends a message, with a cooldown of 25-35s (randomly picked too)."
+    },
+    {
+      "role": "assistant",
+      "text": "Plan before code:\n\n- **discord.py v2** (`bot.tree` slash commands), `python-dotenv`, stdlib `sqlite3`\n- `on_message` → check cooldown expiry, award `randint(15,20)`, set `xp_cooldown = now + randint(25,35)`\n- **Level formula:** `level = isqrt(xp // 50) + 1`. One formula, consistent, no lookup table. Level 1 at 0xp, lvl2 @50, lvl3 @200, lvl10 @4050.\n\n⚠️ **Must enable \"Message Content Intent\"** in Discord dev portal → Bot → Privileged Gateway Intents. Without it, `on_message` never fires in servers. No XP at all.\n\nTradeoff to decide: `member_id` alone (global XP, what you asked) vs `(guild_id, member_id)` (per-server XP). Leveling bots usually want per-server. Going with your spec — global — say the word and it's a 3-line change."
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Writing files."
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./bot.py",
+      "content": "\"\"\"Minimal Discord leveling bot. Single file, sqlite, slash commands.\"\"\"\n\nimport math\nimport os\nimport random\nimport sqlite3\nimport time\n\nimport discord\nfrom discord import app_commands\nfrom dotenv import load_dotenv\n\nload_dotenv()\n\nDB_PATH = \"levels.db\"\nXP_MIN, XP_MAX = 15, 20\nCD_MIN, CD_MAX = 25, 35  # seconds\n\n\n# ---------- level curve ----------\n# level 1 @ 0xp, 2 @ 50, 3 @ 200, 4 @ 450, ... 10 @ 4050\ndef xp_for_level(level: int) -> int:\n    return (level - 1) ** 2 * 50\n\n\ndef level_for(xp: int) -> int:\n    return math.isqrt(xp // 50) + 1\n\n\n# ---------- db ----------\n# All DB access happens on the event loop thread, so one shared conn is safe.\ndb = sqlite3.connect(DB_PATH)\ndb.execute(\n    \"\"\"\n    CREATE TABLE IF NOT EXISTS members (\n        member_id   INTEGER PRIMARY KEY,\n        xp          INTEGER NOT NULL DEFAULT 0,\n        xp_cooldown REAL    NOT NULL DEFAULT 0\n    )\n    \"\"\"\n)\ndb.commit()\n\n\ndef get_row(member_id: int) -> sqlite3.Row | None:\n    cur = db.execute(\"SELECT xp, xp_cooldown FROM members WHERE member_id = ?\", (member_id,))\n    row = cur.fetchone()\n    return None if row is None else {\"xp\": row[0], \"xp_cooldown\": row[1]}\n\n\ndef add_xp(member_id: int, amount: int, cooldown_until: float) -> None:\n    db.execute(\n        \"\"\"\n        INSERT INTO members (member_id, xp, xp_cooldown) VALUES (?, ?, ?)\n        ON CONFLICT(member_id) DO UPDATE SET xp = xp + excluded.xp,\n                                             xp_cooldown = excluded.xp_cooldown\n        \"\"\",\n        (member_id, amount, cooldown_until),\n    )\n    db.commit()\n\n\n# ---------- bot ----------\nintents = discord.Intents.default()\nintents.message_content = True  # needs \"Message Content Intent\" enabled in dev portal\n\nbot = discord.Bot(intents=intents)  # py-cord style; see note below\n\n\n@bot.event\nasync def on_ready():\n    print(f\"Logged in as {bot.user} ({bot.user.id})\")\n    for cmd in bot.tree.get_commands():\n        print(f\"  synced /{cmd.name} (guild-scoped)\")\n    # Guild-scoped sync = instant. Swap for `await bot.tree.sync()` for global\n    # (global propagates slowly, up to ~1h).\n    for guild in bot.guilds:\n        await bot.tree.sync(guild=guild)\n\n\n@bot.event\nasync def on_message(message: discord.Message):\n    if message.author.bot or not message.guild:\n        return\n\n    now = time.time()\n    row = get_row(message.author.id)\n\n    if row and now < row[\"xp_cooldown\"]:\n        return\n\n    gained = random.randint(XP_MIN, XP_MAX)\n    cooldown_until = now + random.randint(CD_MIN, CD_MAX)\n    add_xp(message.author.id, gained, cooldown_until)\n\n    print(f\"+{gained} xp -> {message.author} (next grant after {cooldown_until - now:.0f}s)\")\n\n\n@bot.tree.command(name=\"level\", description=\"Show your current level and XP.\")\nasync def level_cmd(interaction: discord.Interaction, member: discord.Member | None = None):\n    target = member or interaction.user\n    row = get_row(target.id)\n    xp = row[\"xp\"] if row else 0\n\n    lv = level_for(xp)\n    floor = xp_for_level(lv)\n    ceil = xp_for_level(lv + 1)\n    into = xp - floor\n    need = ceil - floor\n    pct = into / need\n\n    bar_len = 10\n    filled = round(pct * bar_len)\n    bar = \"█\" * filled + \"░\" * (bar_len - filled)\n\n    embed = discord.Embed(title=f\"Level {lv}\", colour=discord.Colour.blurple())\n    embed.add_field(name=\"XP total\", value=f\"{xp:,}\", inline=True)\n    embed.add_field(name=\"Progress\", value=f\"`{bar}` {into}/{need}\", inline=False)\n    embed.set_footer(text=f\"{target.display_name}'s stats\")\n    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)\n\n    await interaction.response.send_message(embed=embed)\n\n\nif __name__ == \"__main__\":\n    token = os.getenv(\"TOKEN\")\n    if not token:\n        raise SystemExit(\"TOKEN not set. Add it to .env\")\n    bot.run(token)\n"
+    },
+    {
+      "role": "assistant",
+      "text": "Two API bugs in my draft — `discord.Bot` is py-cord, not discord.py. Fixing to discord.py v2 (`commands.Bot`, `Optional` instead of PEP604 unions which discord.py's param resolver won't resolve)."
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./bot.py",
+      "diff": [
+        "--- ./bot.py",
+        "+++ ./bot.py",
+        "@@ edit 1 @@",
+        "-import math",
+        "-import os",
+        "-import random",
+        "-import sqlite3",
+        "-import time",
+        "-",
+        "-import discord",
+        "-from discord import app_commands",
+        "-from dotenv import load_dotenv",
+        "+import math",
+        "+import os",
+        "+import random",
+        "+import sqlite3",
+        "+import time",
+        "+from typing import Optional",
+        "+",
+        "+import discord",
+        "+from discord.ext import commands",
+        "+from dotenv import load_dotenv",
+        "@@ edit 2 @@",
+        "-def get_row(member_id: int) -> sqlite3.Row | None:",
+        "+def get_row(member_id: int) -> Optional[dict]:",
+        "@@ edit 3 @@",
+        "-bot = discord.Bot(intents=intents)  # py-cord style; see note below",
+        "+bot = commands.Bot(command_prefix=\"!\", intents=intents)",
+        "@@ edit 4 @@",
+        "-@bot.tree.command(name=\"level\", description=\"Show your current level and XP.\")",
+        "-async def level_cmd(interaction: discord.Interaction, member: discord.Member | None = None):",
+        "+@bot.tree.command(name=\"level\", description=\"Show your current level and XP.\")",
+        "+@app_commands.describe(member=\"Optional member to inspect\")",
+        "+async def level_cmd(",
+        "+    interaction: discord.Interaction, member: Optional[discord.Member] = None",
+        "+):"
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "Need `app_commands` import back — I use `@app_commands.describe`."
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./bot.py",
+      "diff": [
+        "--- ./bot.py",
+        "+++ ./bot.py",
+        "@@ edit 1 @@",
+        "-import discord",
+        "-from discord.ext import commands",
+        "+import discord",
+        "+from discord import app_commands",
+        "+from discord.ext import commands"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./requirements.txt",
+      "content": "discord.py>=2.3,<3\npython-dotenv>=1.0\n"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./.env.example",
+      "content": "TOKEN=your-bot-token-here\n"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./.gitignore",
+      "content": ".env\nlevels.db\n__pycache__/\n*.pyc\n.venv/\n"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Curve verified — boundaries clean, no off-by-one."
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./todo.md",
+      "content": "# rotator — todo\n\n## Done\n- [x] Single-file bot (`bot.py`), discord.py v2 + slash commands\n- [x] sqlite `members(member_id, xp, xp_cooldown)`\n- [x] `on_message`: +15-20 xp, cooldown `now + randint(25,35)`s\n- [x] `/level` — embed with level, total xp, progress bar\n- [x] Level curve: `level = isqrt(xp // 50) + 1`, `xp_for_level(L) = (L-1)^2 * 50`\n\n## Open\n- [ ] **Enable Message Content Intent** in dev portal → Bot → Privileged Gateway\n      Intents. Without it `on_message` never fires → zero XP. Most likely first bug.\n- [ ] Invite bot with `scope=bot` + `applications.commands`\n      (URL: `https://discord.com/api/oauth2/authorize?client_id=<ID>&permissions=277025508352&scope=bot%20applications.commands`)\n- [ ] Command sync currently **per-guild on startup** (instant). Switch to\n      `await bot.tree.sync()` (global) for production — global takes up to ~1h to appear.\n- [ ] XP is **global per user**, not per-server. If we want per-guild:\n      `PRIMARY KEY (guild_id, member_id)` + pass `message.guild.id` everywhere.\n\n## Later ideas\n- [ ] Level-up announcement in channel (needs to compare level before/after grant)\n- [ ] `/leaderboard` — top 10 by xp\n- [ ] Role rewards at level thresholds\n- [ ] Cooldown is silently swallowed. Maybe show remaining time on `/level`\n      (`xp_cooldown - now` is already stored)\n- [ ] Blocking sqlite calls on event loop — fine now, revisit if guild count grows\n      (`aiosqlite` or `asyncio.to_thread`)\n"
+    },
+    {
+      "role": "assistant",
+      "text": "Files:\n\n```\nrotator/\n├── bot.py           # everything\n├── requirements.txt # discord.py, python-dotenv\n├── .env.example     # TOKEN=\n├── .gitignore       # .env, levels.db\n└── todo.md\n```\n\nCore logic:\n\n```python\ndef xp_for_level(level): return (level - 1) ** 2 * 50\ndef level_for(xp):       return math.isqrt(xp // 50) + 1\n```\n\n```python\nif row and now < row[\"xp_cooldown\"]:\n    return\ngained = random.randint(15, 20)\ncooldown_until = now + random.randint(25, 35)\n```\n\nUpkeep uses `INSERT ... ON CONFLICT DO UPDATE` — one statement, no read-modify-write race.\n\nRun:\n```bash\npython3 -m venv .venv && source .venv/bin/activate\npip install -r requirements.txt\ncp .env.example .env   # paste token\npython bot.py\n```\n\nThree gotchas, all in todo.md:\n\n1. **Message Content Intent off = no XP, ever.** Silent failure. Check portal first if bot connects but XP never lands.\n2. Invite URL needs `applications.commands` scope or slash commands won't appear.\n3. Sync is per-guild (instant) for dev convenience. Global sync takes up to an hour.\n\nTwo things I'd push back on:\n\n- **Global XP across servers.** You asked for `member_id` only, but if this bot joins 2 servers one user farms XP in both. Per-guild key is a 3-line change — worth deciding now rather than migrating `levels.db` later.\n- **No level-up message.** You said minimal, so I left it out. But a leveling bot that never announces level-ups feels dead — users won't notice progression. Cheap to add, high perceived value. Want it?"
+    },
+    {
+      "role": "user",
+      "text": "cool yeah make xp per guild and move all db functionablity to db.py (so bot.py only contacts through it) and then all .py to src/"
+    },
+    {
+      "role": "assistant",
+      "text": "Per-guild confirmed. Structure:\n\n```\nrotator/src/{bot.py, db.py}\n```\n\nImport style: `import db` (runs `python src/bot.py`, src/ on sys.path). Not `python -m src.bot` — that'd need package/relative imports. Fine for 2 files.\n\nDB path anchored to project root via `__file__`, so `levels.db` doesn't scatter based on cwd."
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./src/db.py",
+      "content": "\"\"\"All sqlite access lives here. bot.py never touches sqlite directly.\"\"\"\n\nimport sqlite3\nfrom dataclasses import dataclass\nfrom pathlib import Path\nfrom typing import Optional\n\n# Anchored to project root so cwd doesn't matter.\nDB_PATH = Path(__file__).resolve().parent.parent / \"levels.db\"\n\n_conn: Optional[sqlite3.Connection] = None\n\n\n@dataclass\nclass Member:\n    guild_id: int\n    member_id: int\n    xp: int\n    xp_cooldown: float  # unix time until next grant is allowed\n\n\ndef init(path: Path | str = DB_PATH) -> None:\n    \"\"\"Open connection and create schema. Must be called before use.\"\"\"\n    global _conn\n    _conn = sqlite3.connect(path)\n    _conn.execute(\n        \"\"\"\n        CREATE TABLE IF NOT EXISTS members (\n            guild_id    INTEGER NOT NULL,\n            member_id   INTEGER NOT NULL,\n            xp          INTEGER NOT NULL DEFAULT 0,\n            xp_cooldown REAL    NOT NULL DEFAULT 0,\n            PRIMARY KEY (guild_id, member_id)\n        )\n        \"\"\"\n    )\n    _conn.commit()\n\n\ndef _db() -> sqlite3.Connection:\n    if _conn is None:\n        raise RuntimeError(\"db.init() was not called\")\n    return _conn\n\n\ndef get_member(guild_id: int, member_id: int) -> Optional[Member]:\n    row = _db().execute(\n        \"SELECT guild_id, member_id, xp, xp_cooldown FROM members \"\n        \"WHERE guild_id = ? AND member_id = ?\",\n        (guild_id, member_id),\n    ).fetchone()\n    if row is None:\n        return None\n    return Member(*row)\n\n\ndef get_xp(guild_id: int, member_id: int) -> int:\n    member = get_member(guild_id, member_id)\n    return member.xp if member else 0\n\n\ndef add_xp(guild_id: int, member_id: int, amount: int, cooldown_until: float) -> None:\n    \"\"\"Insert-or-update in one statement — no read-modify-write race.\"\"\"\n    _db().execute(\n        \"\"\"\n        INSERT INTO members (guild_id, member_id, xp, xp_cooldown) VALUES (?, ?, ?, ?)\n        ON CONFLICT(guild_id, member_id) DO UPDATE\n            SET xp = xp + excluded.xp,\n                xp_cooldown = excluded.xp_cooldown\n        \"\"\",\n        (guild_id, member_id, amount, cooldown_until),\n    )\n    _db().commit()\n"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./src/bot.py",
+      "content": "\"\"\"Minimal Discord leveling bot. discord.py v2, slash commands, per-guild XP.\"\"\"\n\nimport math\nimport os\nimport random\nimport time\nfrom typing import Optional\n\nimport discord\nfrom discord import app_commands\nfrom discord.ext import commands\nfrom dotenv import load_dotenv\n\nimport db\n\nload_dotenv()\n\nXP_MIN, XP_MAX = 15, 20\nCD_MIN, CD_MAX = 25, 35  # seconds\n\n\n# ---------- level curve ----------\n# level 1 @ 0xp, 2 @ 50, 3 @ 200, 4 @ 450, ... 10 @ 4050\ndef xp_for_level(level: int) -> int:\n    return (level - 1) ** 2 * 50\n\n\ndef level_for(xp: int) -> int:\n    return math.isqrt(xp // 50) + 1\n\n\n# ---------- bot ----------\nintents = discord.Intents.default()\nintents.message_content = True  # needs \"Message Content Intent\" enabled in dev portal\n\nbot = commands.Bot(command_prefix=\"!\", intents=intents)\n\n\n@bot.event\nasync def on_ready():\n    print(f\"Logged in as {bot.user} ({bot.user.id})\")\n    # Guild-scoped sync = instant. Swap for `await bot.tree.sync()` for global\n    # (global propagates slowly, up to ~1h).\n    for guild in bot.guilds:\n        await bot.tree.sync(guild=guild)\n        print(f\"  synced /level to {guild.name}\")\n\n\n@bot.event\nasync def on_message(message: discord.Message):\n    if message.author.bot or not message.guild:\n        return\n\n    now = time.time()\n    member = db.get_member(message.guild.id, message.author.id)\n\n    if member and now < member.xp_cooldown:\n        return\n\n    gained = random.randint(XP_MIN, XP_MAX)\n    cooldown_until = now + random.randint(CD_MIN, CD_MAX)\n    db.add_xp(message.guild.id, message.author.id, gained, cooldown_until)\n\n    print(\n        f\"+{gained} xp -> {message.author} in {message.guild.name} \"\n        f\"(locked {cooldown_until - now:.0f}s)\"\n    )\n\n\n@bot.tree.command(name=\"level\", description=\"Show your current level and XP.\")\n@app_commands.describe(member=\"Optional member to inspect\")\nasync def level_cmd(\n    interaction: discord.Interaction, member: Optional[discord.Member] = None\n):\n    target = member or interaction.user\n    xp = db.get_xp(interaction.guild_id, target.id)\n\n    lv = level_for(xp)\n    floor = xp_for_level(lv)\n    ceil = xp_for_level(lv + 1)\n    into = xp - floor\n    need = ceil - floor\n\n    bar_len = 10\n    filled = round(into / need * bar_len)\n    bar = \"█\" * filled + \"░\" * (bar_len - filled)\n\n    embed = discord.Embed(\n        title=f\"Level {lv}\",\n        description=f\"`{bar}` {into}/{need} to level {lv + 1}\",\n        colour=discord.Colour.blurple(),\n    )\n    embed.add_field(name=\"Total XP\", value=f\"{xp:,}\", inline=True)\n    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)\n\n    await interaction.response.send_message(embed=embed)\n\n\nif __name__ == \"__main__\":\n    db.init()\n    token = os.getenv(\"TOKEN\")\n    if not token:\n        raise SystemExit(\"TOKEN not set. Add it to .env\")\n    bot.run(token)\n"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Testing db.py in isolation (temp db, no bot run):"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Isolation verified: same user in guild 111 vs 222 tracked separately, upsert accumulates (20+10=30), unknown guild returns 0."
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./todo.md",
+      "diff": [
+        "--- ./todo.md",
+        "+++ ./todo.md",
+        "@@ edit 1 @@",
+        "-## Done",
+        "-- [x] Single-file bot (`bot.py`), discord.py v2 + slash commands",
+        "-- [x] sqlite `members(member_id, xp, xp_cooldown)`",
+        "-- [x] `on_message`: +15-20 xp, cooldown `now + randint(25,35)`s",
+        "-- [x] `/level` — embed with level, total xp, progress bar",
+        "-- [x] Level curve: `level = isqrt(xp // 50) + 1`, `xp_for_level(L) = (L-1)^2 * 50`",
+        "-",
+        "-## Open",
+        "-- [ ] **Enable Message Content Intent** in dev portal → Bot → Privileged Gateway",
+        "-      Intents. Without it `on_message` never fires → zero XP. Most likely first bug.",
+        "-- [ ] Invite bot with `scope=bot` + `applications.commands`",
+        "-      (URL: `https://discord.com/api/oauth2/authorize?client_id=<ID>&permissions=277025508352&scope=bot%20applications.commands`)",
+        "-- [ ] Command sync currently **per-guild on startup** (instant). Switch to",
+        "-      `await bot.tree.sync()` (global) for production — global takes up to ~1h to appear.",
+        "-- [ ] XP is **global per user**, not per-server. If we want per-guild:",
+        "-      `PRIMARY KEY (guild_id, member_id)` + pass `message.guild.id` everywhere.",
+        "-",
+        "-## Later ideas",
+        "-- [ ] Level-up announcement in channel (needs to compare level before/after grant)",
+        "-- [ ] `/leaderboard` — top 10 by xp",
+        "-- [ ] Role rewards at level thresholds",
+        "-- [ ] Cooldown is silently swallowed. Maybe show remaining time on `/level`",
+        "-      (`xp_cooldown - now` is already stored)",
+        "-- [ ] Blocking sqlite calls on event loop — fine now, revisit if guild count grows",
+        "-      (`aiosqlite` or `asyncio.to_thread`)",
+        "+## Done",
+        "+- [x] `src/bot.py` (bot) + `src/db.py` (all sqlite access)",
+        "+- [x] sqlite `members(guild_id, member_id, xp, xp_cooldown)`, PK `(guild_id, member_id)`",
+        "+- [x] XP is **per-guild**. Verified isolation + upsert accumulation in isolation test",
+        "+- [x] `on_message`: +15-20 xp, cooldown `now + randint(25,35)`s",
+        "+- [x] `/level` — embed with level, total xp, progress bar",
+        "+- [x] Level curve: `level = isqrt(xp // 50) + 1`, `xp_for_level(L) = (L-1)^2 * 50`",
+        "+",
+        "+## Run",
+        "+```bash",
+        "+source .venv/bin/activate   # or: python3 -m venv .venv && pip install -r requirements.txt",
+        "+python src/bot.py",
+        "+```",
+        "+`levels.db` always lands in project root regardless of cwd (path anchored in `db.py`).",
+        "+",
+        "+## Open",
+        "+- [ ] **Enable Message Content Intent** in dev portal → Bot → Privileged Gateway",
+        "+      Intents. Without it `on_message` never fires → zero XP. Most likely first bug.",
+        "+- [ ] Invite bot with `scope=bot` + `applications.commands`",
+        "+      (URL: `https://discord.com/api/oauth2/authorize?client_id=<ID>&permissions=277025508352&scope=bot%20applications.commands`)",
+        "+- [ ] Command sync currently **per-guild on startup** (instant). Switch to",
+        "+      `await bot.tree.sync()` (global) for production — global takes up to ~1h to appear.",
+        "+",
+        "+## Later ideas",
+        "+- [ ] Level-up announcement in channel (needs to compare level before/after grant)",
+        "+- [ ] `/leaderboard` — top 10 by xp. Needs new `db.top_members(guild_id, limit)`",
+        "+- [ ] Role rewards at level thresholds",
+        "+- [ ] Cooldown is silently swallowed. Maybe show remaining time on `/level`",
+        "+      (`member.xp_cooldown - now` is already stored)",
+        "+- [ ] Level curve currently lives in `bot.py`. If it grows (multipliers, role bonuses)",
+        "+      move to `src/levels.py` — `db.py` should stay pure storage",
+        "+- [ ] Blocking sqlite calls on event loop — fine now, revisit if guild count grows",
+        "+      (`aiosqlite` or `asyncio.to_thread`)"
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "Done.\n\n```\nrotator/\n├── src/\n│   ├── bot.py     # discord only. no sqlite import\n│   └── db.py      # all sqlite. no discord import\n```\n\n`db.py` API — bot.py calls nothing else:\n\n```python\ndb.init()                                   # open + create schema\ndb.get_member(guild_id, member_id) -> Member | None\ndb.get_xp(guild_id, member_id) -> int\ndb.add_xp(guild_id, member_id, amount, cooldown_until)\n```\n\nSchema:\n\n```sql\nPRIMARY KEY (guild_id, member_id)\n```\n\nClean layering: `db.py` imports zero discord, `bot.py` imports zero sqlite.\n\nTwo notes:\n\n**Level curve stayed in `bot.py`.** It's game rules, not storage — `db.py` should stay a dumb store. If bonuses/multipliers show up later, it gets its own `levels.py`. Noted in todo.\n\n**`db.init()` is explicit, called in `__main__`.** Auto-init on import is a hidden side effect; this way test code picks its own path (that's how the `:memory:` test ran). Cost: one line, and a `RuntimeError` if you forget — better than a mystery `NoneType has no attribute execute`.\n\nRun: `python src/bot.py`"
+    },
+    {
+      "role": "user",
+      "text": "add docker + compose so i can host the whole thing with portainer later on"
+    },
+    {
+      "role": "assistant",
+      "text": "Notes before writing:\n\n- **No `ports:`** — bot makes outbound WSS only, listens on nothing. Common reflex to add a port mapping; there's nothing to map.\n- **Volume is mandatory** — `levels.db` on the container filesystem = every recreate wipes all XP.\n- `DB_PATH` becomes env-overridable so the db can live on the volume while local dev still uses project root.\n- Omit `version:` key — obsolete in Compose v2, Portainer warns on it."
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./Dockerfile",
+      "content": "FROM python:3.13-slim\n\nENV PYTHONUNBUFFERED=1 \\\n    PYTHONDONTWRITEBYTECODE=1\n\nWORKDIR /app\n\n# deps first -> this layer survives source edits on rebuild\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\n\nCOPY src/ ./src/\n\n# Unprivileged user. /app/data is the sqlite volume mount point and must be\n# writable by it (named volumes inherit ownership from the image dir).\nRUN useradd --create-home --uid 10001 app \\\n    && mkdir -p /app/data \\\n    && chown -R app:app /app/data\n\nUSER app\n\nENV DB_PATH=/app/data/levels.db\n\nCMD [\"python\", \"src/bot.py\"]\n"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./docker-compose.yml",
+      "content": "name: rotator\n\nservices:\n  bot:\n    build: .\n    # For the registry flow instead of building on the host: comment out\n    # `build:` and point this at your image (Portainer can then pull + deploy).\n    # image: ghcr.io/<you>/rotator:latest\n    container_name: rotator\n    restart: unless-stopped\n    environment:\n      TOKEN: ${TOKEN}          # from shell .env locally, or Portainer stack env vars\n      DB_PATH: /app/data/levels.db\n    volumes:\n      - rotator-data:/app/data\n    # No `ports:` block on purpose. The bot opens outbound WSS to Discord's\n    # gateway and listens on nothing. Nothing to expose.\n\nvolumes:\n  rotator-data:\n"
+    },
+    {
+      "role": "tool",
+      "name": "write",
+      "path": "./.dockerignore",
+      "content": ".git\n.gitignore\n.env\n.venv\n__pycache__\n*.pyc\ndata/\nlevels.db\nDockerfile\ndocker-compose.yml\ntodo.md\n"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./src/db.py",
+      "diff": [
+        "--- ./src/db.py",
+        "+++ ./src/db.py",
+        "@@ edit 1 @@",
+        "-import sqlite3",
+        "-from dataclasses import dataclass",
+        "-from pathlib import Path",
+        "-from typing import Optional",
+        "-",
+        "-# Anchored to project root so cwd doesn't matter.",
+        "-DB_PATH = Path(__file__).resolve().parent.parent / \"levels.db\"",
+        "+import os",
+        "+import sqlite3",
+        "+from dataclasses import dataclass",
+        "+from pathlib import Path",
+        "+from typing import Optional",
+        "+",
+        "+# Local default: project root, so cwd doesn't matter. DB_PATH overrides it --",
+        "+# Docker points this at /app/data/levels.db so the db lives on a volume.",
+        "+_DEFAULT_DB = Path(__file__).resolve().parent.parent / \"levels.db\"",
+        "+DB_PATH = Path(os.getenv(\"DB_PATH\", str(_DEFAULT_DB)))"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./.gitignore",
+      "diff": [
+        "--- ./.gitignore",
+        "+++ ./.gitignore",
+        "@@ edit 1 @@",
+        "-.env",
+        "-levels.db",
+        "-__pycache__/",
+        "-*.pyc",
+        "-.venv/",
+        "-",
+        "+.env",
+        "+levels.db",
+        "+data/",
+        "+__pycache__/",
+        "+*.pyc",
+        "+.venv/",
+        "+"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Env override resolves correctly. Failure is my test's fault — sqlite won't create parent dirs. But that's a real footgun worth closing in `init()`:"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./src/db.py",
+      "diff": [
+        "--- ./src/db.py",
+        "+++ ./src/db.py",
+        "@@ edit 1 @@",
+        "-    global _conn",
+        "-    _conn = sqlite3.connect(path)",
+        "+    global _conn",
+        "+    path = Path(path)",
+        "+    path.parent.mkdir(parents=True, exist_ok=True)  # sqlite won't create parent dirs",
+        "+    _conn = sqlite3.connect(path)"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Compose valid. Building to verify the Dockerfile actually works:"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Docker daemon down (Docker Desktop not running). Not starting it for you. Compose validates; **image build is unverified** — run it yourself:\n\n```bash\ndocker build -t rotator:test .\n```"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./todo.md",
+      "diff": [
+        "--- ./todo.md",
+        "+++ ./todo.md",
+        "@@ edit 1 @@",
+        "-- [x] Level curve: `level = isqrt(xp // 50) + 1`, `xp_for_level(L) = (L-1)^2 * 50`",
+        "-",
+        "-## Run",
+        "-```bash",
+        "-source .venv/bin/activate   # or: python3 -m venv .venv && pip install -r requirements.txt",
+        "-python src/bot.py",
+        "-```",
+        "-`levels.db` always lands in project root regardless of cwd (path anchored in `db.py`).",
+        "+- [x] Level curve: `level = isqrt(xp // 50) + 1`, `xp_for_level(L) = (L-1)^2 * 50`",
+        "+- [x] `db.init()` auto-creates parent dirs (sqlite won't). `DB_PATH` env override.",
+        "+- [x] Docker: `Dockerfile` (non-root, deps layer cached) + `docker-compose.yml`",
+        "+      + named volume `rotator-data` at `/app/data`",
+        "+",
+        "+## Run",
+        "+Local:",
+        "+```bash",
+        "+source .venv/bin/activate   # or: python3 -m venv .venv && pip install -r requirements.txt",
+        "+python src/bot.py           # levels.db -> project root",
+        "+```",
+        "+Docker:",
+        "+```bash",
+        "+docker compose up -d --build    # needs TOKEN in .env or exported",
+        "+```",
+        "+Portainer: Stack form -> paste `docker-compose.yml` -> add `TOKEN` under",
+        "+Environment variables. `docker compose config` validates clean.",
+        "+**`docker build` itself unverified** (daemon was not running) — run it once locally first.",
+        "@@ edit 2 @@",
+        "-## Later ideas",
+        "-- [ ] Level-up announcement in channel (needs to compare level before/after grant)",
+        "+## Later ideas",
+        "+- [ ] No container healthcheck — bot exposes no HTTP endpoint, so there is nothing",
+        "+      to probe. If wanted: write a heartbeat file from a `tasks.loop` and check mtime.",
+        "+- [ ] For registry-based deploys, build + push (`ghcr.io/<you>/rotator`) and swap",
+        "+      `build:` for `image:` in compose. Portainer then pulls instead of building.",
+        "+- [ ] Bind-mount alternative for `rotator-data`: host dir must be chown'd to uid 10001",
+        "+      (named volumes inherit ownership from the image, bind mounts do not).",
+        "+- [ ] Level-up announcement in channel (needs to compare level before/after grant)"
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "Added:\n\n```\nDockerfile           python:3.13-slim, non-root uid 10001, deps layer cached\ndocker-compose.yml   restart: unless-stopped, named volume, no ports\n.dockerignore        excludes .env (secret never baked into image)\n```\n\n**db.py change:**\n```python\nDB_PATH = Path(os.getenv(\"DB_PATH\", str(_DEFAULT_DB)))\n# init(): path.parent.mkdir(parents=True, exist_ok=True)\n```\nLocal dev → `./levels.db`. Container → `/app/data/levels.db` on the volume. Same code both ways.\n\nVerified: `python -m py_compile`, `DB_PATH` override resolves, `:memory:` unaffected by the mkdir guard, nested dirs auto-create, `docker compose config` clean.\n\nFour things to know:\n\n1. **Bind mount ≠ named volume.** Named volume inherits ownership from the image's `/app/data` (chowned to 10001). If you bind-mount a host dir instead, it won't — sqlite write fails with a permission error. Use the named volume, or `chown 10001:10001` the host dir.\n2. **`TOKEN: ${TOKEN}`** — Portainer: add it under stack Environment variables. Locally: `.env` in the compose dir. If missing, bot exits `TOKEN not set` rather than silently looping.\n3. **No healthcheck.** Bot exposes no HTTP endpoint, nothing to probe. Container shows \"running\", not \"healthy\". Options in todo.\n4. **`restart: unless-stopped`** not `always` — survives crashes and reboots but still respects a manual `stop`, so you can actually take it down."
+    },
+    {
+      "role": "user",
+      "text": "and since the codebase looks pretty readable could we rid it of the current overwhelming # comments everywhere"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Mostly agree. But two comments aren't decoration — they mark silent traps. Plan: **kill decoration, keep trap notes, and where a comment states a unit, put the unit in the name instead.**"
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./src/bot.py",
+      "diff": [
+        "--- ./src/bot.py",
+        "+++ ./src/bot.py",
+        "@@ edit 1 @@",
+        "-XP_MIN, XP_MAX = 15, 20",
+        "-CD_MIN, CD_MAX = 25, 35  # seconds",
+        "-",
+        "-",
+        "-# ---------- level curve ----------",
+        "-# level 1 @ 0xp, 2 @ 50, 3 @ 200, 4 @ 450, ... 10 @ 4050",
+        "-def xp_for_level(level: int) -> int:",
+        "-    return (level - 1) ** 2 * 50",
+        "-",
+        "-",
+        "-def level_for(xp: int) -> int:",
+        "-    return math.isqrt(xp // 50) + 1",
+        "-",
+        "-",
+        "-# ---------- bot ----------",
+        "-intents = discord.Intents.default()",
+        "-intents.message_content = True  # needs \"Message Content Intent\" enabled in dev portal",
+        "-",
+        "-bot = commands.Bot(command_prefix=\"!\", intents=intents)",
+        "-",
+        "-",
+        "-@bot.event",
+        "-async def on_ready():",
+        "-    print(f\"Logged in as {bot.user} ({bot.user.id})\")",
+        "-    # Guild-scoped sync = instant. Swap for `await bot.tree.sync()` for global",
+        "-    # (global propagates slowly, up to ~1h).",
+        "-    for guild in bot.guilds:",
+        "-        await bot.tree.sync(guild=guild)",
+        "-        print(f\"  synced /level to {guild.name}\")",
+        "+XP_MIN, XP_MAX = 15, 20",
+        "+COOLDOWN_MIN_SECS, COOLDOWN_MAX_SECS = 25, 35",
+        "+",
+        "+",
+        "+def xp_for_level(level: int) -> int:",
+        "+    \"\"\"XP needed to reach a level: 1@0, 2@50, 3@200, 4@450, 10@4050.\"\"\"",
+        "+    return (level - 1) ** 2 * 50",
+        "+",
+        "+",
+        "+def level_for(xp: int) -> int:",
+        "+    \"\"\"Inverse of xp_for_level.\"\"\"",
+        "+    return math.isqrt(xp // 50) + 1",
+        "+",
+        "+",
+        "+intents = discord.Intents.default()",
+        "+# also requires the Message Content Intent toggle in the Discord dev portal,",
+        "+# otherwise on_message never fires in servers and no XP is ever awarded.",
+        "+intents.message_content = True",
+        "+",
+        "+bot = commands.Bot(command_prefix=\"!\", intents=intents)",
+        "+",
+        "+",
+        "+@bot.event",
+        "+async def on_ready():",
+        "+    print(f\"Logged in as {bot.user} ({bot.user.id})\")",
+        "+    # per-guild sync is instant; a bare bot.tree.sync() is global and can take ~1h",
+        "+    for guild in bot.guilds:",
+        "+        await bot.tree.sync(guild=guild)",
+        "+        print(f\"  synced /level to {guild.name}\")",
+        "@@ edit 2 @@",
+        "-    gained = random.randint(XP_MIN, XP_MAX)",
+        "-    cooldown_until = now + random.randint(CD_MIN, CD_MAX)",
+        "+    gained = random.randint(XP_MIN, XP_MAX)",
+        "+    cooldown_until = now + random.randint(COOLDOWN_MIN_SECS, COOLDOWN_MAX_SECS)"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./src/db.py",
+      "diff": [
+        "--- ./src/db.py",
+        "+++ ./src/db.py",
+        "@@ edit 1 @@",
+        "-\"\"\"All sqlite access lives here. bot.py never touches sqlite directly.\"\"\"",
+        "-",
+        "-import os",
+        "-import sqlite3",
+        "-from dataclasses import dataclass",
+        "-from pathlib import Path",
+        "-from typing import Optional",
+        "-",
+        "-# Local default: project root, so cwd doesn't matter. DB_PATH overrides it --",
+        "-# Docker points this at /app/data/levels.db so the db lives on a volume.",
+        "-_DEFAULT_DB = Path(__file__).resolve().parent.parent / \"levels.db\"",
+        "-DB_PATH = Path(os.getenv(\"DB_PATH\", str(_DEFAULT_DB)))",
+        "+\"\"\"All sqlite access lives here. bot.py never touches sqlite directly.",
+        "+",
+        "+The db file defaults to levels.db in the project root; the DB_PATH env var",
+        "+overrides it (Docker points that at a volume).",
+        "+\"\"\"",
+        "+",
+        "+import os",
+        "+import sqlite3",
+        "+from dataclasses import dataclass",
+        "+from pathlib import Path",
+        "+from typing import Optional",
+        "+",
+        "+_DEFAULT_DB = Path(__file__).resolve().parent.parent / \"levels.db\"",
+        "+DB_PATH = Path(os.getenv(\"DB_PATH\", str(_DEFAULT_DB)))",
+        "@@ edit 2 @@",
+        "-    xp_cooldown: float  # unix time until next grant is allowed",
+        "+    xp_cooldown: float  # unix ts of next allowed xp grant",
+        "@@ edit 3 @@",
+        "-    path = Path(path)",
+        "-    path.parent.mkdir(parents=True, exist_ok=True)  # sqlite won't create parent dirs",
+        "-    _conn = sqlite3.connect(path)",
+        "+    path = Path(path)",
+        "+    path.parent.mkdir(parents=True, exist_ok=True)",
+        "+    _conn = sqlite3.connect(path)"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./Dockerfile",
+      "diff": [
+        "--- ./Dockerfile",
+        "+++ ./Dockerfile",
+        "@@ edit 1 @@",
+        "-# deps first -> this layer survives source edits on rebuild",
+        "-COPY requirements.txt .",
+        "-RUN pip install --no-cache-dir -r requirements.txt",
+        "-",
+        "-COPY src/ ./src/",
+        "-",
+        "-# Unprivileged user. /app/data is the sqlite volume mount point and must be",
+        "-# writable by it (named volumes inherit ownership from the image dir).",
+        "-RUN useradd --create-home --uid 10001 app \\",
+        "+COPY requirements.txt .",
+        "+RUN pip install --no-cache-dir -r requirements.txt",
+        "+",
+        "+COPY src/ ./src/",
+        "+",
+        "+RUN useradd --create-home --uid 10001 app \\"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./docker-compose.yml",
+      "diff": [
+        "--- ./docker-compose.yml",
+        "+++ ./docker-compose.yml",
+        "@@ edit 1 @@",
+        "-  bot:",
+        "-    build: .",
+        "-    # For the registry flow instead of building on the host: comment out",
+        "-    # `build:` and point this at your image (Portainer can then pull + deploy).",
+        "-    # image: ghcr.io/<you>/rotator:latest",
+        "-    container_name: rotator",
+        "-    restart: unless-stopped",
+        "-    environment:",
+        "-      TOKEN: ${TOKEN}          # from shell .env locally, or Portainer stack env vars",
+        "-      DB_PATH: /app/data/levels.db",
+        "-    volumes:",
+        "-      - rotator-data:/app/data",
+        "-    # No `ports:` block on purpose. The bot opens outbound WSS to Discord's",
+        "-    # gateway and listens on nothing. Nothing to expose.",
+        "+  bot:",
+        "+    build: .",
+        "+    container_name: rotator",
+        "+    restart: unless-stopped",
+        "+    environment:",
+        "+      TOKEN: ${TOKEN}",
+        "+      DB_PATH: /app/data/levels.db",
+        "+    volumes:",
+        "+      - rotator-data:/app/data",
+        "+    # no ports: the bot only opens outbound WSS to Discord's gateway"
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "No venv yet — `discord` not installed. Creating one (not running the bot, just import check):"
+    },
+    {
+      "role": "tool",
+      "name": "bash"
+    },
+    {
+      "role": "assistant",
+      "text": "Now real verification against installed discord.py: `/level` registers, curve correct, renamed constants resolve."
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./todo.md",
+      "diff": [
+        "--- ./todo.md",
+        "+++ ./todo.md",
+        "@@ edit 1 @@",
+        "-- [x] `DB_PATH` env override.",
+        "-- [x] Docker: `Dockerfile` (non-root, deps layer cached) + `docker-compose.yml`",
+        "-      + named volume `rotator-data` at `/app/data`",
+        "+- [x] `DB_PATH` env override.",
+        "+- [x] Docker: `Dockerfile` (non-root, deps layer cached) + `docker-compose.yml`",
+        "+      + named volume `rotator-data` at `/app/data`",
+        "+- [x] Comment cleanup: 20 inline comments -> 5. Constants renamed to carry units",
+        "+      (`CD_MIN/CD_MAX` -> `COOLDOWN_MIN_SECS/COOLDOWN_MAX_SECS`), level-curve table",
+        "+      moved into `xp_for_level` docstring",
+        "+- [x] Import-checked against real discord.py — `/level` registers, curve + cooldown",
+        "+      constants resolve. `.venv` created, deps installed.",
+        "@@ edit 2 @@",
+        "-## Later ideas",
+        "-- [ ] No container healthcheck — bot exposes no HTTP endpoint, so there is nothing",
+        "-      to probe. If wanted: write a heartbeat file from a `tasks.loop` and check mtime.",
+        "+## Later ideas",
+        "+- [ ] No container healthcheck — bot exposes no HTTP endpoint, so there is nothing",
+        "+      to probe. If wanted: write a heartbeat file from a `tasks.loop` and check mtime.",
+        "+- [ ] For registry-based deploys, build + push (`ghcr.io/<you>/rotator`) and swap",
+        "+      `build:` for `image:` in compose. Portainer then pulls instead of building."
+      ]
+    },
+    {
+      "role": "tool",
+      "name": "read"
+    },
+    {
+      "role": "tool",
+      "name": "edit",
+      "path": "./todo.md",
+      "diff": [
+        "--- ./todo.md",
+        "+++ ./todo.md",
+        "@@ edit 1 @@",
+        "-      + named volume `rotator-data` at `/app/data`",
+        "+      + named volume `rotator-data` at `/app/data`",
+        "+- [x] Comment cleanup: 20 inline comments -> 5. Units moved into names",
+        "+      (`CD_MIN/CD_MAX` -> `COOLDOWN_MIN_SECS/COOLDOWN_MAX_SECS`), level-curve table",
+        "+      moved into `xp_for_level` docstring",
+        "+- [x] Import-checked against real discord.py — `/level` registers, curve + cooldown",
+        "+      constants resolve. `.venv` created, deps installed."
+      ]
+    },
+    {
+      "role": "assistant",
+      "text": "Comments: **20 → 5**\n\n| file | before | after |\n|---|---|---|\n| `src/bot.py` | 7 | 3 |\n| `src/db.py` | 4 | 1 |\n| `Dockerfile` | 3 | 0 |\n| `docker-compose.yml` | 6 | 1 |\n\nDeleted: section banners (`# ---------- level curve ----------`), restatements (`# sqlite won't create parent dirs` above a `mkdir`), Docker layering note, the 3-line registry aside, `# seconds`.\n\nMoved rather than deleted:\n- level-curve sample values → `xp_for_level` docstring\n- `DB_PATH` behavior → `db.py` module docstring\n- units → **names**: `CD_MIN/CD_MAX` → `COOLDOWN_MIN_SECS/COOLDOWN_MAX_SECS`\n\nRenamed instead of commented: a `# seconds` note rots, an `*_SECS` name can't be misread.\n\nFive I kept, all non-derivable:\n\n```python\nintents.message_content = True   # portal toggle required, else no XP ever\n# per-guild sync is instant; a bare bot.tree.sync() is global and can take ~1h\nxp_cooldown: float  # unix ts of next allowed xp grant\n# no ports: the bot only opens outbound WSS to Discord's gateway\n```\n\nThose four flag things a reader would otherwise get wrong silently — the intent toggle and the ts unit especially. Say the word if you want them gone too; they'd be the only ones I'd call defensible deletions.\n\nVerified after edit: `py_compile`, `db` isolation asserts, `import bot` under real discord.py, `/level` in the command tree, curve `(0→1, 50→2, 200→3, 4050→10)`, compose config clean."
+    }
+  ]
+}

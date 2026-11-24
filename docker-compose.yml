@@ -1,0 +1,16 @@
+name: rotator
+
+services:
+  bot:
+    build: .
+    container_name: rotator
+    restart: unless-stopped
+    environment:
+      TOKEN: ${TOKEN}
+      DB_PATH: /app/data/levels.db
+    volumes:
+      - rotator-data:/app/data
+    # no ports: the bot only opens outbound WSS to Discord's gateway
+
+volumes:
+  rotator-data:
