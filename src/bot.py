@@ -29,7 +29,6 @@ XP_GROWTH = 1.25
 
 BAR_LEN = 10
 BAR_FULL, BAR_EMPTY = "🟩", "⬛"
-MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 EMBED_COLOR = discord.Colour(0xFF4023)
 
 LEVEL_ROLES: dict[int, int | str] = {
@@ -224,11 +223,6 @@ async def level_cmd(
         filled = max(0, min(BAR_LEN, round(into / need * BAR_LEN)))
         return BAR_FULL * filled + BAR_EMPTY * (BAR_LEN - filled)
 
-    def cooldown_text(row: Optional[db.Member]) -> str:
-        if row is None or row.xp_cooldown <= time.time():
-            return "✅ ready"
-        return f"<t:{int(row.xp_cooldown)}:R>"
-
     target = member or ctx.author
     row = db.get_member(ctx.guild.id, target.id)
     xp = row.xp if row else 0
@@ -236,23 +230,23 @@ async def level_cmd(
     lv = level_for(xp)
     floor, ceil = xp_for_level(lv), xp_for_level(lv + 1)
     into, need = xp - floor, ceil - floor
-    rank, total = db.get_rank(ctx.guild.id, target.id)
+    rank, _ = db.get_rank(ctx.guild.id, target.id)
 
-    embed = discord.Embed(title=f"⭐ Level {lv}", colour=EMBED_COLOR)
-    embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
+    if rank:
+        rank_text = f"{target.display_name} is ranked #{rank} · "
+    else:
+        rank_text = f"{target.display_name} · "
+
+    embed = discord.Embed(title=f"Level {lv}", colour=EMBED_COLOR)
     embed.set_thumbnail(url=target.display_avatar.url)
     if xp:
         embed.description = (
             f"{progress_bar(into, need)} **{into / need:.0%}**\n"
-            f"`{into:,} / {need:,}` XP to **level {lv + 1}**"
+            f"`{into:,}/{need:,}xp` to **level {lv + 1}**!"
         )
     else:
-        embed.description = "No XP yet — chat in this server to start."
-    embed.add_field(name="⚡ Total XP", value=f"{xp:,}", inline=True)
-    rank_text = f"#{rank} of {total}" if rank else f"unranked / {total}"
-    embed.add_field(name="📊 Rank", value=rank_text, inline=True)
-    embed.add_field(name="⏳ Next XP", value=cooldown_text(row), inline=True)
-    embed.set_footer(text=ctx.guild.name)
+        embed.description = "No xp yet — chat in this server to start."
+    embed.set_footer(text=f"{rank_text}{xp:,}xp total")
 
     await ctx.send(embed=embed)
 
@@ -272,21 +266,20 @@ async def leaderboard_cmd(ctx: commands.Context, limit: int = 10):
         *(resolve_member(ctx.guild, row.member_id) for row in rows)
     )
     for pos, (row, member) in enumerate(zip(rows, resolved), 1):
-        medal = MEDALS.get(pos, f"`{pos:>2}`")
         name = (member.display_name if member else "ex-member")[:20]
-        lines.append(f"{medal} **{name}** — lv {level_for(row.xp)} · `{row.xp:,}` xp")
+        lines.append(f"`{pos:>2}` **{name}** - lv{level_for(row.xp)} · `{row.xp:,}xp`")
 
-    rank, total = db.get_rank(ctx.guild.id, ctx.author.id)
+    rank, _ = db.get_rank(ctx.guild.id, ctx.author.id)
     own_lv = level_for(db.get_xp(ctx.guild.id, ctx.author.id))
 
+    own_rank = f"ranked **#{rank}**" if rank else "unranked"
+    you = f"**You** are {own_rank} at lv{own_lv}."
+
     embed = discord.Embed(
-        title=f"🏆 Top {len(rows)} — {ctx.guild.name}",
-        description="\n".join(lines),
+        title="Leaderboard",
+        description="\n".join(lines) + f"\n\n{you}",
         colour=EMBED_COLOR,
     )
-    own_rank = f"#{rank} of {total}" if rank else f"unranked / {total}"
-    embed.add_field(name="You", value=f"{own_rank} · lv {own_lv}", inline=False)
-    embed.set_footer(text="XP is tracked per server")
 
     await ctx.send(embed=embed)
 
