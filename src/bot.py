@@ -1,5 +1,6 @@
 """Minimal Discord leveling bot. discord.py v2, hybrid commands, per-guild XP."""
 
+import asyncio
 import math
 import os
 import random
@@ -30,6 +31,15 @@ BAR_LEN = 10
 BAR_FULL, BAR_EMPTY = "🟩", "⬛"
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
+# Level roles: threshold -> role name or id, highest matching one wins, all others removed.
+# Rename to whatever your server uses. Needs the Manage Roles permission and the
+# bot's own role above these. Missing/unclosable roles are skipped silently.
+LEVEL_ROLES: dict[int, int | str] = {
+    1: 1574737918725984367,
+    2: 1574737938380754954,
+    3: 1574737952934731957,
+}
+
 
 def xp_for_level(level: int) -> int:
     """Total XP needed to reach `level`. Level 1 is 0."""
@@ -57,6 +67,56 @@ def level_colour(level: int) -> discord.Colour:
 def progress_bar(into: int, need: int) -> str:
     filled = max(0, min(BAR_LEN, round(into / need * BAR_LEN)))
     return BAR_FULL * filled + BAR_EMPTY * (BAR_LEN - filled)
+
+
+async def resolve_member(guild: discord.Guild, member_id: int) -> Optional[discord.Member]:
+    """Cache first, then REST. Intents.members is off, so the cache is mostly empty."""
+    member = guild.get_member(member_id)
+    if member:
+        return member
+    try:
+        return await guild.fetch_member(member_id)
+    except discord.HTTPException:
+        return None
+
+
+def _find_role(guild: discord.Guild, spec: int | str) -> Optional[discord.Role]:
+    if isinstance(spec, int):
+        return guild.get_role(spec)
+    return discord.utils.get(guild.roles, name=spec)
+
+
+async def sync_level_role(member: discord.Member, level: int) -> bool:
+    """Apply the single highest role for `level`, drop the other level roles."""
+    if not LEVEL_ROLES:
+        return False
+
+    guild = member.guild
+    top = guild.me.top_role if guild.me else None
+    managed: list[discord.Role] = []
+    target: Optional[discord.Role] = None
+    for threshold, spec in sorted(LEVEL_ROLES.items()):
+        role = _find_role(guild, spec)
+        if role is None or role.is_default() or (top and role >= top):
+            continue
+        managed.append(role)
+        if threshold <= level:
+            target = role
+
+    current = [role for role in member.roles if role in managed]
+    if current == ([target] if target else []):
+        return False
+
+    roles = [role for role in member.roles if role not in managed]
+    if target:
+        roles.append(target)
+    roles.sort(key=lambda role: role.position, reverse=True)
+    try:
+        await member.edit(roles=roles, reason=f"rotator: level {level}")
+    except discord.Forbidden as exc:
+        print(f"role sync blocked for {member}: {exc}")
+        return False
+    return True
 
 
 def level_table(top: int = 30) -> None:
@@ -103,6 +163,7 @@ async def on_message(message: discord.Message):
     old_lv, new_lv = level_for(before), level_for(after)
     if new_lv > old_lv:
         await announce_level_up(message, old_lv, new_lv)
+    await sync_level_role(message.author, new_lv)
 
     print(f"+{gained} xp -> {message.author} in {message.guild.name} (lv {new_lv})")
 
@@ -137,6 +198,38 @@ async def sync_cmd(ctx: commands.Context):
         bot.tree.add_command(cmd.copy(), guild=ctx.guild, override=True)
     synced = await bot.tree.sync(guild=ctx.guild)
     await ctx.send(f"synced {[c.name for c in synced]} in {ctx.guild.name}")
+
+
+# Re-apply level roles: one member, or everyone with XP on this server.
+# Goes through the XP table + REST, so it works without the members intent.
+@bot.command(name="roles")
+@commands.guild_only()
+async def roles_cmd(ctx: commands.Context, *, target: Optional[discord.Member] = None):
+    if ctx.author.id != OWNER_ID:
+        return
+
+    if target:
+        pairs = [(target, db.get_xp(ctx.guild.id, target.id))]
+    else:
+        pairs = []
+        for row in db.top_members(ctx.guild.id, 1000):
+            member = await resolve_member(ctx.guild, row.member_id)
+            if member:
+                pairs.append((member, row.xp))
+
+    changed = 0
+    for member, xp in pairs:
+        changed += await sync_level_role(member, level_for(xp))
+
+    configured = [_find_role(ctx.guild, spec) for spec in LEVEL_ROLES.values()]
+    missing = [
+        str(spec) for spec, role in zip(LEVEL_ROLES.values(), configured) if role is None
+    ]
+    note = f" | no such role: {', '.join(missing)}" if missing else ""
+    await ctx.send(
+        f"checked {len(pairs)} members, updated {changed} "
+        f"(roles: {sorted(LEVEL_ROLES.items())}){note}"
+    )
 
 
 def cooldown_text(row: Optional[db.Member]) -> str:
@@ -190,9 +283,11 @@ async def leaderboard_cmd(ctx: commands.Context, limit: int = 10):
         return
 
     lines = []
-    for pos, row in enumerate(rows, 1):
+    resolved = await asyncio.gather(
+        *(resolve_member(ctx.guild, row.member_id) for row in rows)
+    )
+    for pos, (row, member) in enumerate(zip(rows, resolved), 1):
         medal = MEDALS.get(pos, f"`{pos:>2}`")
-        member = ctx.guild.get_member(row.member_id)
         name = (member.display_name if member else "ex-member")[:20]
         lines.append(f"{medal} **{name}** — lv {level_for(row.xp)} · `{row.xp:,}` xp")
 
