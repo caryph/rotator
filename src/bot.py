@@ -17,29 +17,38 @@ import db
 
 load_dotenv()
 
+# --- config ---------------------------------------------------------------------------
+
 OWNER_ID = 520293520418930690
 
 XP_MIN, XP_MAX = 15, 20
 COOLDOWN_MIN_SECS, COOLDOWN_MAX_SECS = 25, 35
 
-# Level curve: each level costs XP_GROWTH x more than the previous one.
-# Closed form of a geometric series, so level_for() is exact, no lookup table.
-XP_BASE = 100.0
-XP_GROWTH = 1.12
+XP_BASE = 50.0  # cost of level 2
+XP_GROWTH = 1.25
 
 BAR_LEN = 10
 BAR_FULL, BAR_EMPTY = "🟩", "⬛"
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+EMBED_COLOR = discord.Colour(0xFF4023)
 
-# Level roles: threshold -> role name or id, highest matching one wins, all others removed.
-# Rename to whatever your server uses. Needs the Manage Roles permission and the
-# bot's own role above these. Missing/unclosable roles are skipped silently.
 LEVEL_ROLES: dict[int, int | str] = {
     1: 1574741880841834616,
     2: 1574741906045280256,
     3: 1574741924709924946,
 }
 
+# --- bot ------------------------------------------------------------------------------
+
+intents = discord.Intents.default()
+# needs the Message Content Intent toggle in the dev portal too, else no XP ever.
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="r!", intents=intents)
+bot.remove_command("help")
+
+
+# --- XP curve -------------------------------------------------------------------------
 
 def xp_for_level(level: int) -> int:
     """Total XP needed to reach `level`. Level 1 is 0."""
@@ -60,14 +69,7 @@ def level_for(xp: int) -> int:
     return level
 
 
-def level_colour(level: int) -> discord.Colour:
-    return discord.Colour.from_hsv((level * 0.08) % 1.0, 0.55, 0.85)
-
-
-def progress_bar(into: int, need: int) -> str:
-    filled = max(0, min(BAR_LEN, round(into / need * BAR_LEN)))
-    return BAR_FULL * filled + BAR_EMPTY * (BAR_LEN - filled)
-
+# --- members & roles ------------------------------------------------------------------
 
 async def resolve_member(guild: discord.Guild, member_id: int) -> Optional[discord.Member]:
     """Cache first, then REST. Intents.members is off, so the cache is mostly empty."""
@@ -119,20 +121,7 @@ async def sync_level_role(member: discord.Member, level: int) -> bool:
     return True
 
 
-def level_table(top: int = 30) -> None:
-    """Tuning aid: `python src/bot.py table`."""
-    for level in range(1, top + 1):
-        total = xp_for_level(level + 1)
-        print(f"level {level + 1:>3}  total {total:>8,}  (+{total - xp_for_level(level):>6,})")
-
-
-intents = discord.Intents.default()
-# needs the Message Content Intent toggle in the dev portal too, else no XP ever.
-intents.message_content = True
-
-bot = commands.Bot(command_prefix="r!", intents=intents)
-bot.remove_command("help")
-
+# --- events ---------------------------------------------------------------------------
 
 @bot.event
 async def on_ready():
@@ -162,29 +151,20 @@ async def on_message(message: discord.Message):
 
     old_lv, new_lv = level_for(before), level_for(after)
     if new_lv > old_lv:
-        await announce_level_up(message, old_lv, new_lv)
+        steps = new_lv - old_lv
+        bonus = f" (+{steps} levels)" if steps > 1 else ""
+        try:
+            await message.channel.send(
+                f"🎉 {message.author.mention} reached **level {new_lv}**{bonus}"
+            )
+        except discord.Forbidden:
+            pass
     await sync_level_role(message.author, new_lv)
 
     print(f"+{gained} xp -> {message.author} in {message.guild.name} (lv {new_lv})")
 
 
-async def announce_level_up(
-    message: discord.Message, old_lv: int, new_lv: int
-) -> None:
-    steps = new_lv - old_lv
-    embed = discord.Embed(
-        description=(
-            f"{'🎉' * min(steps, 5)} {message.author.mention} reached "
-            f"**level {new_lv}**" + (f" (+{steps} levels)" if steps > 1 else "")
-        ),
-        colour=level_colour(new_lv),
-    )
-    embed.set_thumbnail(url=message.author.display_avatar.url)
-    try:
-        await message.channel.send(embed=embed)
-    except discord.Forbidden:
-        pass
-
+# --- owner commands -------------------------------------------------------------------
 
 # leafbot-style manual sync, needs the applications.commands scope on the invite.
 # dpy >=2.7 gotcha: tree.sync(guild=) only uploads guild-scoped commands, so
@@ -232,11 +212,7 @@ async def roles_cmd(ctx: commands.Context, *, target: Optional[discord.Member] =
     )
 
 
-def cooldown_text(row: Optional[db.Member]) -> str:
-    if row is None or row.xp_cooldown <= time.time():
-        return "✅ ready"
-    return f"<t:{int(row.xp_cooldown)}:R>"
-
+# --- user commands --------------------------------------------------------------------
 
 @bot.hybrid_command(name="level", description="Show your current level and XP.")
 @app_commands.describe(member="Optional member to inspect")
@@ -244,6 +220,15 @@ def cooldown_text(row: Optional[db.Member]) -> str:
 async def level_cmd(
     ctx: commands.Context, member: Optional[discord.Member] = None
 ):
+    def progress_bar(into: int, need: int) -> str:
+        filled = max(0, min(BAR_LEN, round(into / need * BAR_LEN)))
+        return BAR_FULL * filled + BAR_EMPTY * (BAR_LEN - filled)
+
+    def cooldown_text(row: Optional[db.Member]) -> str:
+        if row is None or row.xp_cooldown <= time.time():
+            return "✅ ready"
+        return f"<t:{int(row.xp_cooldown)}:R>"
+
     target = member or ctx.author
     row = db.get_member(ctx.guild.id, target.id)
     xp = row.xp if row else 0
@@ -253,7 +238,7 @@ async def level_cmd(
     into, need = xp - floor, ceil - floor
     rank, total = db.get_rank(ctx.guild.id, target.id)
 
-    embed = discord.Embed(title=f"⭐ Level {lv}", colour=level_colour(lv))
+    embed = discord.Embed(title=f"⭐ Level {lv}", colour=EMBED_COLOR)
     embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
     embed.set_thumbnail(url=target.display_avatar.url)
     if xp:
@@ -297,13 +282,37 @@ async def leaderboard_cmd(ctx: commands.Context, limit: int = 10):
     embed = discord.Embed(
         title=f"🏆 Top {len(rows)} — {ctx.guild.name}",
         description="\n".join(lines),
-        colour=level_colour(level_for(rows[0].xp)),
+        colour=EMBED_COLOR,
     )
     own_rank = f"#{rank} of {total}" if rank else f"unranked / {total}"
     embed.add_field(name="You", value=f"{own_rank} · lv {own_lv}", inline=False)
     embed.set_footer(text="XP is tracked per server")
 
     await ctx.send(embed=embed)
+
+
+# --- tuning CLI -----------------------------------------------------------------------
+
+def level_table(top: int = 50) -> None:
+    """Tuning aid: `python src/bot.py table`.
+
+    msgs = total XP / mean XP per message; hours assumes back-to-back messaging at
+    the mean cooldown, i.e. the fastest a single user could possibly climb.
+    """
+    avg_xp = (XP_MIN + XP_MAX) / 2
+    avg_cooldown = (COOLDOWN_MIN_SECS + COOLDOWN_MAX_SECS) / 2
+
+    def duration(hours: float) -> str:
+        return f"{hours * 60:>5.0f}m" if hours < 1 else f"{hours:>5.1f}h"
+
+    print(f"avg {avg_xp:g} xp/msg, {avg_cooldown:g}s cooldown -> {3600 / avg_cooldown:.0f} msg/h max\n")
+    for level in range(1, top + 1):
+        total = xp_for_level(level + 1)
+        msgs = total / avg_xp
+        print(
+            f"level {level + 1:>3}  total {total:>8,}  (+{total - xp_for_level(level):>6,})"
+            f"  ~{msgs:>7,.0f} msgs  ~{duration(msgs * avg_cooldown / 3600)}"
+        )
 
 
 if __name__ == "__main__":
