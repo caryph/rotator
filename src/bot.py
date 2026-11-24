@@ -1,4 +1,4 @@
-"""Minimal Discord leveling bot. discord.py v2, slash commands, per-guild XP."""
+"""Minimal Discord leveling bot. discord.py v2, hybrid commands, per-guild XP."""
 
 import math
 import os
@@ -17,6 +17,7 @@ load_dotenv()
 
 XP_MIN, XP_MAX = 15, 20
 COOLDOWN_MIN_SECS, COOLDOWN_MAX_SECS = 25, 35
+OWNER_ID = 520293520418930690
 
 
 def xp_for_level(level: int) -> int:
@@ -34,19 +35,18 @@ intents = discord.Intents.default()
 # otherwise on_message never fires in servers and no XP is ever awarded.
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="r!", intents=intents)
+bot.remove_command("help")
 
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
-    # per-guild sync is instant; a bare bot.tree.sync() is global and can take ~1h
-    for guild in bot.guilds:
-        await bot.tree.sync(guild=guild)
-        print(f"  synced /level to {guild.name}")
 
 
-@bot.event
+# bot.listen instead of @bot.event: a plain on_message here would replace
+# Bot.on_message and silently kill every prefix/hybrid command.
+@bot.listen()
 async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
@@ -67,13 +67,24 @@ async def on_message(message: discord.Message):
     )
 
 
-@bot.tree.command(name="level", description="Show your current level and XP.")
+# leafbot-style manual sync: per-guild, instant, run it yourself when you change
+# a command. Needs the applications.commands scope on the invite.
+@bot.command(name="sync")
+async def sync_cmd(ctx: commands.Context):
+    if ctx.author.id != OWNER_ID:
+        return
+    synced = await bot.tree.sync(guild=ctx.guild)
+    await ctx.send(f"synced {[c.name for c in synced]}")
+
+
+@bot.hybrid_command(name="level", description="Show your current level and XP.")
 @app_commands.describe(member="Optional member to inspect")
+@commands.guild_only()
 async def level_cmd(
-    interaction: discord.Interaction, member: Optional[discord.Member] = None
+    ctx: commands.Context, member: Optional[discord.Member] = None
 ):
-    target = member or interaction.user
-    xp = db.get_xp(interaction.guild_id, target.id)
+    target = member or ctx.author
+    xp = db.get_xp(ctx.guild.id, target.id)
 
     lv = level_for(xp)
     floor = xp_for_level(lv)
@@ -93,7 +104,7 @@ async def level_cmd(
     embed.add_field(name="Total XP", value=f"{xp:,}", inline=True)
     embed.set_author(name=target.display_name, icon_url=target.display_avatar.url)
 
-    await interaction.response.send_message(embed=embed)
+    await ctx.send(embed=embed)
 
 
 if __name__ == "__main__":
