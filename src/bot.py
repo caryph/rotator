@@ -35,9 +35,9 @@ MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 # Rename to whatever your server uses. Needs the Manage Roles permission and the
 # bot's own role above these. Missing/unclosable roles are skipped silently.
 LEVEL_ROLES: dict[int, int | str] = {
-    1: 1574737918725984367,
-    2: 1574737938380754954,
-    3: 1574737952934731957,
+    1: 1574741880841834616,
+    2: 1574741906045280256,
+    3: 1574741924709924946,
 }
 
 
