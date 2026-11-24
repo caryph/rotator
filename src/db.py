@@ -24,6 +24,19 @@ class Member:
     xp_cooldown: float  # unix ts of next allowed xp grant
 
 
+@dataclass
+class Giveaway:
+    id: int
+    guild_id: int
+    channel_id: int
+    message_id: int
+    host_id: int
+    prize: str
+    ends_at: float  # unix ts the Join! button stops working
+    winners: int
+    ended: bool
+
+
 def init(path: Path | str = DB_PATH) -> None:
     """Open connection and create schema. Must be called before use."""
     global _conn
@@ -38,6 +51,30 @@ def init(path: Path | str = DB_PATH) -> None:
             xp          INTEGER NOT NULL DEFAULT 0,
             xp_cooldown REAL    NOT NULL DEFAULT 0,
             PRIMARY KEY (guild_id, member_id)
+        )
+        """
+    )
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS giveaways (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id   INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL DEFAULT 0,
+            host_id    INTEGER NOT NULL,
+            prize      TEXT    NOT NULL,
+            ends_at    REAL    NOT NULL,
+            winners    INTEGER NOT NULL DEFAULT 1,
+            ended      INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    _conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS giveaway_entries (
+            giveaway_id INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            PRIMARY KEY (giveaway_id, user_id)
         )
         """
     )
@@ -89,6 +126,107 @@ def top_members(guild_id: int, limit: int = 10, offset: int = 0) -> list[Member]
         (guild_id, limit, offset),
     ).fetchall()
     return [Member(*row) for row in rows]
+
+
+# --- giveaways ------------------------------------------------------------------------
+
+_GIVEAWAY_COLS = (
+    "id, guild_id, channel_id, message_id, host_id, prize, ends_at, winners, ended"
+)
+
+
+def _giveaway(row: Optional[tuple]) -> Optional[Giveaway]:
+    return None if row is None else Giveaway(*row[:8], bool(row[8]))
+
+
+def create_giveaway(
+    guild_id: int,
+    channel_id: int,
+    host_id: int,
+    prize: str,
+    ends_at: float,
+    winners: int,
+) -> int:
+    """Row is created before the message exists, hence message_id 0 until the send."""
+    row = _db().execute(
+        "INSERT INTO giveaways (guild_id, channel_id, host_id, prize, ends_at, winners) "
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        (guild_id, channel_id, host_id, prize, ends_at, winners),
+    ).fetchone()
+    _db().commit()
+    return row[0]
+
+
+def set_giveaway_message(giveaway_id: int, message_id: int) -> None:
+    _db().execute(
+        "UPDATE giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id)
+    )
+    _db().commit()
+
+
+def get_giveaway(giveaway_id: int) -> Optional[Giveaway]:
+    row = _db().execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE id = ?", (giveaway_id,)
+    ).fetchone()
+    return _giveaway(row)
+
+
+def get_giveaway_by_message(message_id: int) -> Optional[Giveaway]:
+    row = _db().execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return _giveaway(row)
+
+
+def active_giveaways() -> list[Giveaway]:
+    rows = _db().execute(
+        f"SELECT {_GIVEAWAY_COLS} FROM giveaways WHERE ended = 0"
+    ).fetchall()
+    return [_giveaway(row) for row in rows]
+
+
+def finish_giveaway(giveaway_id: int) -> bool:
+    """Flip ended 0 -> 1. True only for the caller that actually flipped it, so a
+    restart re-scheduling an old giveaway can never announce it twice."""
+    cur = _db().execute(
+        "UPDATE giveaways SET ended = 1 WHERE id = ? AND ended = 0", (giveaway_id,)
+    )
+    _db().commit()
+    return cur.rowcount == 1
+
+
+def toggle_entry(giveaway_id: int, member_id: int) -> bool:
+    """Join or leave. True means the member is in now."""
+    inside = _db().execute(
+        "SELECT 1 FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+        (giveaway_id, member_id),
+    ).fetchone()
+    if inside:
+        _db().execute(
+            "DELETE FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+            (giveaway_id, member_id),
+        )
+    else:
+        _db().execute(
+            "INSERT INTO giveaway_entries (giveaway_id, user_id) VALUES (?, ?)",
+            (giveaway_id, member_id),
+        )
+    _db().commit()
+    return inside is None
+
+
+def entries(giveaway_id: int) -> list[int]:
+    rows = _db().execute(
+        "SELECT user_id FROM giveaway_entries WHERE giveaway_id = ? ORDER BY user_id",
+        (giveaway_id,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def entry_count(giveaway_id: int) -> int:
+    return _db().execute(
+        "SELECT COUNT(*) FROM giveaway_entries WHERE giveaway_id = ?", (giveaway_id,)
+    ).fetchone()[0]
 
 
 def get_rank(guild_id: int, member_id: int) -> tuple[int, int]:

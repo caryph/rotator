@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -30,6 +31,11 @@ XP_GROWTH = 1.25
 BAR_LEN = 10
 BAR_FULL, BAR_EMPTY = "🟩", "⬛"
 EMBED_COLOR = discord.Colour(0xFF4023)
+
+ADMIN = "[ADMIN]"  # description prefix for admin-only slash commands
+GIVEAWAY_JOIN_ID = "ra:giveaway:join"
+GIVEAWAY_MINUTES_DEFAULT, GIVEAWAY_MINUTES_MAX = 10, 24 * 60
+GIVEAWAY_WINNERS_MAX = 10
 
 LEVEL_ROLES: dict[int, int | str] = {
     1: 1574741880841834616,
@@ -125,6 +131,9 @@ async def sync_level_role(member: discord.Member, level: int) -> bool:
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} ({bot.user.id})")
+    # giveaways survive restarts: re-arm the deadline for everything still open.
+    for giveaway in db.active_giveaways():
+        schedule_giveaway(giveaway)
 
 
 # bot.listen, not bot.event: a plain on_message would override Bot.on_message
@@ -209,6 +218,147 @@ async def roles_cmd(ctx: commands.Context, *, target: Optional[discord.Member] =
         f"checked {len(pairs)} members, updated {changed} "
         f"(roles: {sorted(LEVEL_ROLES.items())}){note}"
     )
+
+
+# --- giveaways ------------------------------------------------------------------------
+# One persistent View serves every giveaway: the button only carries a fixed
+# custom_id, all state (entries, deadline, ended) lives in the db and is keyed by
+# message id. Nothing here pings anyone until finish_giveaway() runs.
+
+giveaway_tasks: dict[int, asyncio.Task] = {}
+
+
+def giveaway_embed(giveaway: db.Giveaway, entries: int) -> discord.Embed:
+    ends = datetime.fromtimestamp(giveaway.ends_at, tz=timezone.utc)
+    stamp = int(giveaway.ends_at)
+    embed = discord.Embed(
+        title="🎁 Giveaway ended" if giveaway.ended else "🎁 Giveaway",
+        description=(
+            f"**{giveaway.prize}**\n\n"
+            + ("No more entries." if giveaway.ended else "Hit **Join!** below to enter.")
+        ),
+        colour=EMBED_COLOR,
+        timestamp=ends,
+    )
+    embed.add_field(name="Ends", value=f"<t:{stamp}:R>\n<t:{stamp}:F>", inline=False)
+    embed.add_field(name="Entries", value=str(entries), inline=True)
+    embed.add_field(name="Winners", value=str(giveaway.winners), inline=True)
+    # embed mentions never notify, so the host stays unpinged while entries run.
+    embed.add_field(name="Host", value=f"<@{giveaway.host_id}>", inline=True)
+    return embed
+
+
+class GiveawayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistent: no per-click timeout
+
+    @discord.ui.button(
+        label="Join!", style=discord.ButtonStyle.danger, custom_id=GIVEAWAY_JOIN_ID
+    )
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaway = db.get_giveaway_by_message(interaction.message.id)
+        if giveaway is None or giveaway.ended or giveaway.ends_at <= time.time():
+            await interaction.response.send_message(
+                "⌛ This giveaway is over.", ephemeral=True
+            )
+            return
+
+        joined = db.toggle_entry(giveaway.id, interaction.user.id)
+        total = db.entry_count(giveaway.id)
+        try:
+            await interaction.message.edit(embed=giveaway_embed(giveaway, total))
+        except discord.HTTPException:
+            pass  # the count will be right on the next click / at the end
+        await interaction.response.send_message(
+            "🎉 You're in!" if joined else "↩️ Entry removed.", ephemeral=True
+        )
+
+
+bot.add_view(GiveawayView())
+
+
+def schedule_giveaway(giveaway: db.Giveaway) -> None:
+    """Arm the deadline. Safe to call twice: on_ready fires on every reconnect."""
+    task = giveaway_tasks.get(giveaway.id)
+    if task and not task.done():
+        return
+    delay = max(0.0, giveaway.ends_at - time.time())
+    giveaway_tasks[giveaway.id] = bot.loop.create_task(finish_later(giveaway.id, delay))
+
+
+async def finish_later(giveaway_id: int, delay: float) -> None:
+    await asyncio.sleep(delay)
+    giveaway_tasks.pop(giveaway_id, None)
+    await finish_giveaway(giveaway_id)
+
+
+async def finish_giveaway(giveaway_id: int) -> None:
+    """Close a giveaway, pick winners, and only now mention anyone."""
+    if not db.finish_giveaway(giveaway_id):
+        return  # another task (e.g. after a restart) already announced this one
+    giveaway = db.get_giveaway(giveaway_id)
+    if giveaway is None:
+        return
+    guild = bot.get_guild(giveaway.guild_id)
+    channel = bot.get_channel(giveaway.channel_id)
+    if guild is None or not isinstance(channel, discord.abc.Messageable):
+        print(f"giveaway {giveaway_id}: channel is gone, skipping")
+        return
+
+    ids = db.entries(giveaway_id)
+    resolved = await asyncio.gather(*(resolve_member(guild, uid) for uid in ids))
+    players = [member for member in resolved if member is not None]
+    winners = random.sample(players, min(giveaway.winners, len(players)))
+
+    try:
+        message = await channel.fetch_message(giveaway.message_id)
+        await message.edit(embed=giveaway_embed(giveaway, len(ids)), view=None)
+    except discord.HTTPException:
+        print(f"giveaway {giveaway_id}: could not edit the giveaway message")
+
+    host = await resolve_member(guild, giveaway.host_id)
+    host_text = host.mention if host else f"<@{giveaway.host_id}>"
+    if not winners:
+        await channel.send(
+            f"😕 No entries for **{giveaway.prize}** — {host_text}, no winner this time."
+        )
+        return
+    won = " ".join(member.mention for member in winners)
+    await channel.send(f"🎉 {won} won **{giveaway.prize}** — {host_text}, congrats!")
+
+
+@bot.hybrid_command(
+    name="giveaway", description=f"{ADMIN} Start a giveaway with a red Join! button."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    prize="What the winners get",
+    minutes=f"How long it runs (1-{GIVEAWAY_MINUTES_MAX}, default {GIVEAWAY_MINUTES_DEFAULT})",
+    winners=f"How many winners (1-{GIVEAWAY_WINNERS_MAX}, default 1)",
+)
+@commands.guild_only()
+async def giveaway_cmd(
+    ctx: commands.Context,
+    prize: str,
+    minutes: int = GIVEAWAY_MINUTES_DEFAULT,
+    winners: int = 1,
+):
+    # default_permissions only hides the command; enforce it for real here.
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("⛔ Administrator only.")
+        return
+
+    minutes = max(1, min(int(minutes), GIVEAWAY_MINUTES_MAX))
+    winners = max(1, min(int(winners), GIVEAWAY_WINNERS_MAX))
+    ends = discord.utils.utcnow() + timedelta(minutes=minutes)
+
+    giveaway_id = db.create_giveaway(
+        ctx.guild.id, ctx.channel.id, ctx.author.id, prize[:200], ends.timestamp(), winners
+    )
+    giveaway = db.get_giveaway(giveaway_id)
+    message = await ctx.send(embed=giveaway_embed(giveaway, 0), view=GiveawayView())
+    db.set_giveaway_message(giveaway_id, message.id)
+    schedule_giveaway(giveaway)
 
 
 # --- user commands --------------------------------------------------------------------
